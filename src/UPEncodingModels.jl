@@ -16,7 +16,7 @@ include("utils.jl")
 include("predictions.jl")
 include("variances.jl")
 include("deviancesummary.jl")
-include("PSTH.jl")
+include("psth.jl")
 
 
 export RaisedCosineBasis, make_spike_history_basis, make_trial_time_basis,
