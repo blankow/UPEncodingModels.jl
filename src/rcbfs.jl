@@ -146,3 +146,6 @@ function make_trial_time_basis(;
 
     return RaisedCosineBasis(B, timepoints, collect(centers), n_basis)
 end
+
+
+

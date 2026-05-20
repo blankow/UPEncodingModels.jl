@@ -37,14 +37,14 @@ end
 Deviance of the null model (constant rate = mean firing rate).
 """
 function null_deviance(y::Vector{Int}, Δ::Float64)
-    μ_bar = mean(y)  # mean count per bin
+    μ_bar = ilmean(y)  # mean count per bin
     λ_null = μ_bar / Δ
     λ_vec = fill(λ_null, length(y))
     return poisson_deviance(y, λ_vec, Δ)
 end
 
 # Inline mean to avoid depending on Statistics.jl
-function mean(x)
+function ilmean(x)
     return sum(x) / length(x)
 end
 

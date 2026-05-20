@@ -19,14 +19,14 @@
 # Load the module — assumes NeuralEncodingGLM.jl is in the same directory
 # or on your LOAD_PATH. If you've already loaded it in your session,
 # comment out the include line.
-include(joinpath(@__DIR__, "NeuralEncodingGLM.jl"))
-using .NeuralEncodingGLM
-using LinearAlgebra
-using Random
+# include(joinpath(@__DIR__, "NeuralEncodingGLM.jl"))
+# using .NeuralEncodingGLM
+# using LinearAlgebra
+# using Random
 
 function main()
 
-Random.seed!(42)
+Random.seed!(37)
 
 
 # ============================================================================
@@ -729,10 +729,10 @@ residuals = Float64.(dm.y) .- μ_hat
 pearson_resid = residuals ./ sqrt.(max.(μ_hat, 1e-12))
 
 println("\n  Residual diagnostics:")
-println("    Mean raw residual:     $(round(NeuralEncodingGLM.mean(residuals), sigdigits=4)) " *
+println("    Mean raw residual:     $(round(ilmean(residuals), sigdigits=4)) " *
         "(should be ≈ 0)")
-println("    Mean Pearson residual: $(round(NeuralEncodingGLM.mean(pearson_resid), sigdigits=4))")
-println("    Var(Pearson resid):    $(round(NeuralEncodingGLM.mean(pearson_resid.^2), sigdigits=4)) " *
+println("    Mean Pearson residual: $(round(ilmean(pearson_resid), sigdigits=4))")
+println("    Var(Pearson resid):    $(round(ilmean(pearson_resid.^2), sigdigits=4)) " *
         "(= 1.0 if Poisson holds; > 1 = overdispersion)")
 
 # Overdispersion factor

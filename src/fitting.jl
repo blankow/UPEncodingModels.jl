@@ -217,7 +217,7 @@ function _fit_irls(
         δ = norm(w_new - w) / (norm(w) + 1e-10)
         if verbose
             ll = poisson_loglik(w_new, X, y, Δ) - 0.5 * w_new' * Λ * w_new
-            println("IRLS iter $iter: Δw = $(round(δ, sigdigits=4)), penalized LL = $(round(ll, sigdigits=6))")
+            # println("IRLS iter $iter: Δw = $(round(δ, sigdigits=4)), penalized LL = $(round(ll, sigdigits=6))")
         end
 
         w = w_new

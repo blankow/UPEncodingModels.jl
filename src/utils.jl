@@ -72,3 +72,37 @@ function extract_spike_history_filter(
     h_weights = fit.w[cols]
     return history_basis.B * h_weights
 end
+
+# ============================================================================
+# EXTRACT EVENT KERNEL (updated for per-event basis)
+# ============================================================================
+
+"""
+    extract_event_kernel(fit, dm, event_name, event_basis) → NamedTuple
+
+Reconstruct the event response kernel κ(δ) from the fitted parameters.
+
+Returns:
+- `lags`: vector of lag times (ms) from the event basis
+- `kernel`: the reconstructed kernel h(δ) = B · w_event
+
+For click events, this kernel represents the average response to a
+single click. Because the model is linear in log-rate space, the
+response to N overlapping clicks is N × kernel (in log-rate), which
+corresponds to a multiplicative scaling of the firing rate by exp(kernel)^N.
+"""
+function extract_event_kernel(
+    fit,  # GLMFit
+    dm,   # DesignMatrix
+    event_name::Symbol,
+    event_basis::RaisedCosineBasis
+)
+    cols = dm.groups[event_name]
+    w_evt = fit.w[cols]
+    kernel = event_basis.B * w_evt
+
+    return (
+        lags = event_basis.timepoints,
+        kernel = kernel
+    )
+end
