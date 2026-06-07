@@ -63,6 +63,46 @@ struct DesignSpec
     history_basis::RaisedCosineBasis
     event_bases::Dict{Symbol, RaisedCosineBasis}
     dt_ms::Float64
+    trial_offsets::Vector{Symbol}
+    # Event-aligned factors: each factor gets a basis evaluated on a lag axis
+    # relative to a specific event.  The tuple is (event_name, condition_key, n_levels).
+    # Filling is backwards: δ_bin = t_event_bin − τ + 1, so basis index 1 = at the
+    # event, 2 = one bin before, etc.  Use :log spacing for denser coverage near
+    # the event and sparser coverage further back.
+    event_aligned_factors::Dict{Symbol, Tuple{Symbol, Symbol, Int}}
+    event_aligned_factor_bases::Dict{Symbol, RaisedCosineBasis}
+    # Anticausal event kernels: backward-looking kernels aligned to events that
+    # may occur outside (after) the trial window.  δ_bin = t_event_bin − τ + 1,
+    # so basis index 1 = at the event, 2 = one bin before, etc.
+    # Every name here must also appear in event_bases.
+    anticausal_events::Vector{Symbol}
+end
+
+function DesignSpec(factors, events, continuous, baseline_basis, encoding_basis,
+                    history_basis, event_bases, dt_ms)
+    DesignSpec(factors, events, continuous, baseline_basis, encoding_basis,
+               history_basis, event_bases, dt_ms, Symbol[],
+               Dict{Symbol, Tuple{Symbol, Symbol, Int}}(),
+               Dict{Symbol, RaisedCosineBasis}(),
+               Symbol[])
+end
+
+function DesignSpec(factors, events, continuous, baseline_basis, encoding_basis,
+                    history_basis, event_bases, dt_ms, trial_offsets)
+    DesignSpec(factors, events, continuous, baseline_basis, encoding_basis,
+               history_basis, event_bases, dt_ms, trial_offsets,
+               Dict{Symbol, Tuple{Symbol, Symbol, Int}}(),
+               Dict{Symbol, RaisedCosineBasis}(),
+               Symbol[])
+end
+
+function DesignSpec(factors, events, continuous, baseline_basis, encoding_basis,
+                    history_basis, event_bases, dt_ms, trial_offsets,
+                    event_aligned_factors, event_aligned_factor_bases)
+    DesignSpec(factors, events, continuous, baseline_basis, encoding_basis,
+               history_basis, event_bases, dt_ms, trial_offsets,
+               event_aligned_factors, event_aligned_factor_bases,
+               Symbol[])
 end
 
 
@@ -181,6 +221,50 @@ end
 
 
 """
+    build_anticausal_event_features(
+        event_times_ms::Vector{Float64},
+        basis::RaisedCosineBasis,
+        T::Int,
+        dt_ms::Float64
+    ) → Matrix{Float64}
+
+Anticausal (backward-looking) version of build_event_train_features.
+At each bin τ, superimposes the kernel for all events at t_event > τ:
+
+    f_l(τ) = Σⱼ  b_l(t_event_j − τ)  ·  𝟙(τ ≤ t_event_j)
+
+δ_bin = t_event_bin − τ + 1, so δ_bin=1 at the event, δ_bin=2 one bin before, etc.
+The event may lie outside the trial window (t_event_bin > T); the kernel still
+fills bins inside the window that are within the kernel span.
+"""
+function build_anticausal_event_features(
+    event_times_ms::Vector{Float64},
+    basis::RaisedCosineBasis,
+    T::Int,
+    dt_ms::Float64
+)
+    n_basis = basis.n_basis
+    n_kernel_pts = size(basis.B, 1)
+    F = zeros(T, n_basis)
+
+    event_bins = [round(Int, t / dt_ms) + 1 for t in event_times_ms]
+
+    for t_evt in event_bins
+        for l in 1:n_basis
+            for δ_bin in 1:n_kernel_pts
+                τ = t_evt - δ_bin + 1
+                if 1 ≤ τ ≤ T
+                    @inbounds F[τ, l] += basis.B[δ_bin, l]
+                end
+            end
+        end
+    end
+
+    return F
+end
+
+
+"""
     build_spike_history_features(spike_counts, history_basis) → Matrix{Float64}
 
 For a single trial's spike train, compute the spike-history features at each
@@ -256,6 +340,11 @@ function build_design_matrix(
                   "entry in spec.event_bases.")
         end
     end
+    for ename in spec.anticausal_events
+        if !haskey(spec.event_bases, ename)
+            error("Anticausal event :$ename has no entry in spec.event_bases.")
+        end
+    end
 
     # ---- Count parameters and assign column groups ----
     groups = Dict{Symbol, UnitRange{Int}}()
@@ -266,10 +355,18 @@ function build_design_matrix(
     groups[:baseline] = col:(col + n_base - 1)
     col += n_base
 
-    # Experimental factors
+    # Experimental factors (trial-onset aligned)
     n_enc = spec.encoding_basis.n_basis
     for (fname, n_levels) in spec.factors
         n_cols = (n_levels - 1) * n_enc
+        groups[fname] = col:(col + n_cols - 1)
+        col += n_cols
+    end
+
+    # Event-aligned factors (each uses its own lag basis)
+    for (fname, (_, _, n_levels)) in spec.event_aligned_factors
+        n_ea = spec.event_aligned_factor_bases[fname].n_basis
+        n_cols = (n_levels - 1) * n_ea
         groups[fname] = col:(col + n_cols - 1)
         col += n_cols
     end
@@ -278,6 +375,12 @@ function build_design_matrix(
     for cname in spec.continuous
         groups[cname] = col:(col + n_enc - 1)
         col += n_enc
+    end
+
+    # Per-trial scalar offsets (single column each)
+    for oname in spec.trial_offsets
+        groups[oname] = col:col
+        col += 1
     end
 
     # Spike history
@@ -292,15 +395,25 @@ function build_design_matrix(
         col += n_evt
     end
 
+    # Anticausal event kernels
+    for ename in spec.anticausal_events
+        n_evt = spec.event_bases[ename].n_basis
+        groups[ename] = col:(col + n_evt - 1)
+        col += n_evt
+    end
+
     n_params = col - 1
 
     # ---- Check for name collisions ----
     all_names = Symbol[]
     push!(all_names, :baseline)
     append!(all_names, collect(keys(spec.factors)))
+    append!(all_names, collect(keys(spec.event_aligned_factors)))
     append!(all_names, spec.continuous)
+    append!(all_names, spec.trial_offsets)
     push!(all_names, :history)
     append!(all_names, spec.events)
+    append!(all_names, spec.anticausal_events)
     if length(all_names) != length(unique(all_names))
         dupes = [n for n in all_names if count(==(n), all_names) > 1]
         error("Name collision in design matrix groups: $(unique(dupes)). " *
@@ -330,7 +443,9 @@ function build_design_matrix(
         # --- Experimental factor encoding ---
         for (fname, n_levels) in spec.factors
             level = trial.condition[fname]
-            indicators = effect_code(level, n_levels)
+            # level == 0 means "unknown/missing" (e.g., previous_choice on trial 1):
+            # contribute nothing (zero vector) rather than erroring or biasing.
+            indicators = level == 0 ? zeros(n_levels - 1) : effect_code(level, n_levels)
 
             cols = groups[fname]
             for c in 1:(n_levels - 1)
@@ -338,6 +453,36 @@ function build_design_matrix(
                     col_idx = cols[1] + (c - 1) * n_enc + (l - 1)
                     for τ in 1:T_t
                         X[row_start + τ - 1, col_idx] = indicators[c] * spec.encoding_basis.B[τ, l]
+                    end
+                end
+            end
+        end
+
+        # --- Event-aligned factor encoding ---
+        for (fname, (ename, ckey, n_levels)) in spec.event_aligned_factors
+            if !haskey(trial.event_times, ename) || isempty(trial.event_times[ename])
+                continue
+            end
+            t_event_ms = trial.event_times[ename][1]
+            t_event_bin = round(Int, t_event_ms / spec.dt_ms) + 1
+
+            basis = spec.event_aligned_factor_bases[fname]
+            n_ea = basis.n_basis
+            n_kernel_pts = size(basis.B, 1)
+
+            level = get(trial.condition, ckey, 0)
+            indicators = level == 0 ? zeros(n_levels - 1) : effect_code(level, n_levels)
+
+            cols = groups[fname]
+            for c in 1:(n_levels - 1)
+                for l in 1:n_ea
+                    col_idx = cols[1] + (c - 1) * n_ea + (l - 1)
+                    for τ in 1:T_t
+                        # δ_bin=1 at the event, δ_bin=2 one bin before, etc.
+                        δ_bin = t_event_bin - τ + 1
+                        if 1 ≤ δ_bin ≤ n_kernel_pts
+                            X[row_start + τ - 1, col_idx] = indicators[c] * basis.B[δ_bin, l]
+                        end
                     end
                 end
             end
@@ -353,6 +498,12 @@ function build_design_matrix(
                     X[row_start + τ - 1, col_idx] = cov_ts[τ] * spec.encoding_basis.B[τ, l]
                 end
             end
+        end
+
+        # --- Per-trial scalar offsets ---
+        for oname in spec.trial_offsets
+            offset_val = trial.continuous_covariates[oname][1]
+            X[rows, groups[oname][1]] .= offset_val
         end
 
         # --- Spike history ---
@@ -374,6 +525,21 @@ function build_design_matrix(
             F = build_event_train_features(evt_times, evt_basis, T_t, spec.dt_ms)
 
             # Write into the design matrix
+            cols = groups[ename]
+            X[rows, cols] .= F[1:T_t, :]
+        end
+
+        # --- Anticausal event kernels (backward-looking; event may be outside window) ---
+        for ename in spec.anticausal_events
+            if !haskey(trial.event_times, ename)
+                continue
+            end
+            evt_times = trial.event_times[ename]
+            if isempty(evt_times)
+                continue
+            end
+            evt_basis = spec.event_bases[ename]
+            F = build_anticausal_event_features(evt_times, evt_basis, T_t, spec.dt_ms)
             cols = groups[ename]
             X[rows, cols] .= F[1:T_t, :]
         end

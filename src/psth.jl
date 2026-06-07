@@ -139,9 +139,11 @@ function compute_psth(
     end
 
     if n_events == 0
-        error("No valid event occurrences found for :$event_name. " *
-              "Check that event_times contains this key with non-empty vectors, " *
-              "and that events aren't too close to trial edges.")
+        @warn "No valid event occurrences found for :$event_name (window_pre=$(window_pre)ms, " *
+              "window_post=$(window_post)ms). Events may be too close to trial edges. " *
+              "Returning NaN-filled result."
+        return (time_ms=time_ms, rate_hz=fill(NaN, n_bins), sem_hz=fill(NaN, n_bins),
+                n_events=0, n_trials_with_event=n_trials_with_event)
     end
 
     # Stack into matrix: (n_events × n_bins)

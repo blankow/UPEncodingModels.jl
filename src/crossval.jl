@@ -1,136 +1,164 @@
 
-
 # ============================================================================
-# crossval.jl: Cross-validation of GLM encoding models, with deviance decomposition by factor
+# crossval.jl: k-fold cross-validation for the Poisson GLM
 # ============================================================================
 
 """
-    crossval_deviance(dm::DesignMatrix, spec::DesignSpec, trials::Vector{TrialData};
-        dt_ms     = 1.0,
-        λ_ridge   = Dict{Symbol,Float64}(),
-        cv_scheme = :trials,
-        n_folds   = 5,
-        verbose   = false
-    ) → NamedTuple
+    make_fold_assignments(n_trials; n_folds=5, seed=42) → Vector{Int}
 
-Cross-validated deviance explained, with decomposition by factor.
-
-## cv_scheme options:
-
-- `:trials` — hold out entire trials. This is the standard approach for
-  assessing how well the model predicts neural responses on new trials
-  of the same experimental conditions. Trials are assigned to folds
-  stratified by condition (as far as possible).
-
-- `:timeblocks` — hold out contiguous blocks of time bins within each trial.
-  Useful for assessing temporal generalization but beware of autocorrelation
-  leaking across the fold boundary. A gap of ~50–100 ms between train and
-  test blocks is recommended.
-
-Returns:
-- `cv_dev_explained::Float64` — cross-validated deviance explained (full model)
-- `cv_factor_contributions::Dict{Symbol,Float64}` — ΔD per factor, cross-validated
-- `fold_results::Vector` — per-fold results for diagnostics
+Assign each of `n_trials` trials to one of `n_folds` folds (balanced,
+randomly shuffled). Used to generate a single assignment that can be
+reused across all model variants for paired deviance comparisons.
 """
-function crossval_deviance(
-    dm::DesignMatrix,
-    trials::Vector{TrialData};
-    dt_ms::Float64                   = 1.0,
-    λ_ridge::Dict{Symbol,Float64}   = Dict{Symbol,Float64}(),
-    n_folds::Int                     = 5,
-    verbose::Bool                    = false
+function make_fold_assignments(n_trials::Int; n_folds::Int=5, seed::Int=42)::Vector{Int}
+    rng = Random.MersenneTwister(seed)
+    perm = Random.randperm(rng, n_trials)
+    assignments = Vector{Int}(undef, n_trials)
+    for (i, trial_idx) in enumerate(perm)
+        assignments[trial_idx] = mod1(i, n_folds)
+    end
+    return assignments
+end
+
+
+"""
+    kfold_crossval(trials, spec, ridge_penalties; kwargs...) → NamedTuple
+
+Fit the Poisson GLM with k-fold cross-validation.
+
+Builds the full design matrix once, then for each fold k slices out the
+training and test rows, fits on the training set, and evaluates held-out
+deviance on the test set.  The null model rate (used for cv_null_deviance)
+is estimated from the training mean so evaluation is genuinely out-of-sample.
+
+Also returns an in-sample fit on all trials so both metrics can be saved
+in a single call.
+
+## Keyword arguments
+- `n_folds=5`
+- `fold_assignments`: pre-computed assignments (length=n_trials, values 1:n_folds).
+  If `nothing`, generated via `make_fold_assignments(n_trials; n_folds, seed)`.
+  Pass the same vector to every model variant for paired comparisons.
+- `seed=42`: RNG seed (only used when fold_assignments=nothing)
+- `dt_ms=2.0`: time bin width in ms
+- `max_iter=100`, `tol=1e-8`: IRLS settings
+
+## Returns
+NamedTuple with:
+- `fold_assignments`
+- `folds`: Vector of per-fold NamedTuples (see below)
+- `cv_deviance`, `cv_null_deviance`, `cv_frac_explained`
+- `insample_fit`, `insample_dm`: full-data fit
+- `insample_devsum`: deviance_summary on all trials
+
+Each fold NamedTuple:
+- `train_indices`, `test_indices`
+- `fit`: GLMFit on training data
+- `test_boundaries`: per-trial row ranges in the test rate vectors
+- `test_trials`: Vector{TrialData} for the test fold
+- `test_predicted_rates`: exp(X_test * w), length = total test bins
+- `test_component_logrates`: Dict{Symbol, Vector{Float64}} on test set
+- `cv_deviance`, `cv_null_deviance`
+"""
+function kfold_crossval(
+    trials::Vector{TrialData},
+    spec::DesignSpec,
+    ridge_penalties::Dict{Symbol, Float64};
+    n_folds::Int = 5,
+    fold_assignments::Union{Nothing, Vector{Int}} = nothing,
+    seed::Int = 42,
+    dt_ms::Float64 = 2.0,
+    max_iter::Int = 100,
+    tol::Float64 = 1e-8
 )
-    Δ = dt_ms / 1000.0
     n_trials = length(trials)
+    Δ = dt_ms / 1000.0
 
-    # Assign trials to folds (simple round-robin; for stratified,
-    # sort trials by condition first)
-    fold_assignment = mod.(0:(n_trials-1), n_folds) .+ 1
-
-    # Accumulators for deviance across folds
-    D_full_total = 0.0
-    D_null_total = 0.0
-    D_reduced = Dict{Symbol, Float64}()
-    for gname in keys(dm.groups)
-        D_reduced[gname] = 0.0
+    if isnothing(fold_assignments)
+        fold_assignments = make_fold_assignments(n_trials; n_folds=n_folds, seed=seed)
     end
-    n_test_total = 0
 
-    fold_results = []
+    # Build the full design matrix once; reuse rows for each fold
+    full_dm = build_design_matrix(trials, spec)
 
-    for fold in 1:n_folds
-        if verbose
-            println("--- Fold $fold / $n_folds ---")
+    # In-sample fit on all trials
+    insample_fit = fit_poisson_glm(full_dm; dt_ms=dt_ms, λ_ridge=ridge_penalties,
+                                    max_iter=max_iter, tol=tol)
+    insample_devsum = deviance_summary(full_dm, insample_fit; dt_ms=dt_ms)
+
+    fold_results = Vector{Any}(undef, n_folds)
+
+    for k in 1:n_folds
+        test_idx  = findall(a -> a == k, fold_assignments)
+        train_idx = findall(a -> a != k, fold_assignments)
+
+        # Row-slice the full DM into train and test subsets
+        test_rows  = vcat([full_dm.trial_boundaries[t] for t in test_idx]...)
+        train_rows = vcat([full_dm.trial_boundaries[t] for t in train_idx]...)
+
+        X_test  = full_dm.X[test_rows,  :]
+        y_test  = full_dm.y[test_rows]
+        X_train = full_dm.X[train_rows, :]
+        y_train = full_dm.y[train_rows]
+
+        # Temporary train DM (trial_boundaries unused by fitter)
+        dm_train = DesignMatrix(X_train, y_train, full_dm.groups,
+                                Vector{UnitRange{Int}}(), full_dm.n_params)
+
+        fit_k = fit_poisson_glm(dm_train; dt_ms=dt_ms, λ_ridge=ridge_penalties,
+                                  max_iter=max_iter, tol=tol)
+
+        # Held-out predictions
+        test_pred_rates = exp.(X_test * fit_k.w)
+
+        # Per-component log-rate contributions on the test set
+        test_comp_lr = Dict{Symbol, Vector{Float64}}()
+        for (gname, cols) in full_dm.groups
+            test_comp_lr[gname] = X_test[:, cols] * fit_k.w[cols]
         end
 
-        # Split trials
-        test_idx  = findall(fold_assignment .== fold)
-        train_idx = findall(fold_assignment .!= fold)
+        # Held-out deviance for this fold
+        cv_dev_k = poisson_deviance(y_test, test_pred_rates, Δ)
 
-        # Gather test/train row indices
-        test_rows  = vcat([dm.trial_boundaries[t] for t in test_idx]...)
-        train_rows = vcat([dm.trial_boundaries[t] for t in train_idx]...)
+        # Null deviance: constant rate estimated from training data, evaluated on test
+        null_rate_hz = Float64(sum(y_train)) / length(y_train) / Δ
+        null_pred    = fill(null_rate_hz, length(y_test))
+        null_dev_k   = poisson_deviance(y_test, null_pred, Δ)
 
-        # Extract submatrices
-        X_train = dm.X[train_rows, :]
-        y_train = dm.y[train_rows]
-        X_test  = dm.X[test_rows, :]
-        y_test  = dm.y[test_rows]
+        # Per-trial boundaries within the test rate vectors (for PSTH assembly)
+        test_boundaries = Vector{UnitRange{Int}}(undef, length(test_idx))
+        offset = 0
+        for (i, t_orig) in enumerate(test_idx)
+            T_t = length(full_dm.trial_boundaries[t_orig])
+            test_boundaries[i] = (offset + 1):(offset + T_t)
+            offset += T_t
+        end
 
-        # Build a temporary DesignMatrix for the training set
-        dm_train = DesignMatrix(
-            X_train, y_train, dm.groups,
-            [1:length(y_train)],  # single block (boundaries not needed for fitting)
-            dm.n_params
+        fold_results[k] = (
+            train_indices           = train_idx,
+            test_indices            = test_idx,
+            fit                     = fit_k,
+            test_boundaries         = test_boundaries,
+            test_trials             = trials[test_idx],
+            test_predicted_rates    = test_pred_rates,
+            test_component_logrates = test_comp_lr,
+            cv_deviance             = cv_dev_k,
+            cv_null_deviance        = null_dev_k,
         )
-
-        # Fit on training data
-        fit_train = fit_poisson_glm(dm_train; dt_ms=dt_ms, λ_ridge=λ_ridge,
-                                     verbose=false)
-
-        # Evaluate on test data
-        λ_test = exp.(X_test * fit_train.w)
-        D_fold_full = poisson_deviance(y_test, λ_test, Δ)
-        D_fold_null = null_deviance(y_test, Δ)
-
-        D_full_total += D_fold_full
-        D_null_total += D_fold_null
-        n_test_total += length(y_test)
-
-        # For each group, evaluate the reduced model on test data
-        for (gname, cols) in dm.groups
-            w_red = copy(fit_train.w)
-            w_red[cols] .= 0.0
-            λ_red = exp.(X_test * w_red)
-            D_reduced[gname] += poisson_deviance(y_test, λ_red, Δ)
-        end
-
-        push!(fold_results, (
-            fold = fold,
-            n_test = length(y_test),
-            D_full = D_fold_full,
-            D_null = D_fold_null,
-            dev_explained = 1.0 - D_fold_full / D_fold_null
-        ))
-
-        if verbose
-            de = 1.0 - D_fold_full / D_fold_null
-            println("  Deviance explained: $(round(de * 100, digits=2))%")
-        end
     end
 
-    # Aggregate
-    cv_de = 1.0 - D_full_total / D_null_total
-
-    cv_factor = Dict{Symbol, Float64}()
-    for (gname, D_red) in D_reduced
-        # ΔD for this group = D_reduced − D_full, aggregated across folds
-        cv_factor[gname] = (D_red - D_full_total) / D_null_total
-    end
+    cv_deviance      = sum(f.cv_deviance      for f in fold_results)
+    cv_null_deviance = sum(f.cv_null_deviance for f in fold_results)
+    cv_frac_explained = 1.0 - cv_deviance / cv_null_deviance
 
     return (
-        cv_dev_explained = cv_de,
-        cv_factor_contributions = cv_factor,
-        fold_results = fold_results
+        fold_assignments  = fold_assignments,
+        folds             = fold_results,
+        cv_deviance       = cv_deviance,
+        cv_null_deviance  = cv_null_deviance,
+        cv_frac_explained = cv_frac_explained,
+        insample_fit      = insample_fit,
+        insample_dm       = full_dm,
+        insample_devsum   = insample_devsum,
     )
 end

@@ -186,7 +186,9 @@ function _fit_irls(
         n_iter = iter
 
         # Predicted rates and expected counts
-        η = X * w
+        # Clamp η to prevent exp() overflow (e.g. from near-collinear predictors
+        # producing large opposite-sign weights during early IRLS iterations)
+        η = clamp.(X * w, -30.0, 30.0)
         μ = Δ .* exp.(η)       # expected counts = Δ · λ
 
         # Clamp μ away from zero for numerical stability

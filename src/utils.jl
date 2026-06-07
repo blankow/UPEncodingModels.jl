@@ -73,6 +73,42 @@ function extract_spike_history_filter(
     return history_basis.B * h_weights
 end
 
+"""
+    compute_local_drift(trial_rates_hz, window=5) → Vector{Float64}
+
+For each trial t, compute the log of the mean firing rate across the
+`window` neighboring trials on each side (excluding trial t itself).
+Used as a per-trial constant offset in the model to absorb slow drift
+in baseline firing rate.
+
+For edge trials (first/last `window` trials), uses only the available
+neighbors in that direction.
+
+Returns a vector of log-rate offsets, one per trial.
+"""
+function compute_local_drift(
+    trial_rates_hz::Vector{Float64},
+    window::Int = 5
+)
+    n = length(trial_rates_hz)
+    log_offsets = Vector{Float64}(undef, n)
+
+    for t in 1:n
+        lo = max(1, t - window)
+        hi = min(n, t + window)
+        neighbor_rates = vcat(
+            lo <= t-1 ? trial_rates_hz[lo:t-1] : Float64[],
+            t+1 <= hi ? trial_rates_hz[t+1:hi] : Float64[]
+        )
+        mean_rate = isempty(neighbor_rates) ? trial_rates_hz[t] :
+                        sum(neighbor_rates) / length(neighbor_rates)
+        log_offsets[t] = log(max(mean_rate, 1e-6))
+    end
+
+    return log_offsets
+end
+
+
 # ============================================================================
 # EXTRACT EVENT KERNEL (updated for per-event basis)
 # ============================================================================
